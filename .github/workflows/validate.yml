@@ -14,7 +14,32 @@ jobs:
       - uses: actions/checkout@v4
       - name: Parse Zabbix YAML
         run: |
-          ruby -e 'require "yaml"; YAML.safe_load(File.read("zabbix_avigilon_unity_video_7.0.yaml"), aliases: true); puts "YAML is valid"'
+          ruby -e '
+            require "yaml"
+            export = YAML.safe_load(File.read("zabbix_avigilon_unity_video_7.0.yaml"), aliases: true)
+            template = export.fetch("zabbix_export").fetch("templates").first
+            scripts = template.fetch("items").select { |item| item["type"] == "SCRIPT" }
+            scripts.each_with_index { |script, index| File.write("/tmp/avigilon-script-#{index}.js", script.fetch("params")) }
+            ids = []
+            walk = lambda do |object|
+              case object
+              when Hash
+                ids << object["uuid"] if object["uuid"]
+                object.each_value { |value| walk.call(value) }
+              when Array
+                object.each { |value| walk.call(value) }
+              end
+            end
+            walk.call(template)
+            duplicates = ids.group_by { |id| id }.select { |_id, values| values.length > 1 }
+            abort "Duplicate UUIDs: #{duplicates.keys.join(", ")}" unless duplicates.empty?
+            puts "YAML is valid; #{scripts.length} scripts; #{ids.length} unique UUIDs"
+          '
+      - name: Check collector JavaScript syntax
+        run: |
+          for script in /tmp/avigilon-script-*.js; do
+            node --check "$script"
+          done
       - name: Reject common credential artifacts
         run: |
           if grep -RniE --exclude-dir=.git '(Authorization:[[:space:]]*Bearer[[:space:]]+eyJ|client_secret[[:space:]]*[:=][[:space:]]*[A-Za-z0-9+/=]{24,})' .; then
