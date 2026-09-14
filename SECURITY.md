@@ -4,7 +4,7 @@
 
 Please do not disclose vulnerabilities or exposed credentials in a public issue.
 
-Use GitHub's private vulnerability reporting feature for this repository. Include enough sanitized detail to reproduce the issue without including real Unity credentials, bearer tokens, internal addresses, camera names, or video-system topology.
+If GitHub private vulnerability reporting is enabled for the repository, use it. Otherwise, contact the maintainer privately through their GitHub profile before public disclosure. Include enough sanitized detail to reproduce the issue without including real Unity credentials, bearer tokens, internal addresses, camera names, or video-system topology.
 
 ## Credential handling
 
