@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented here.
 
+## 2.1.0 - 2026-09-14
+
+- Added mapping from each Unity video source to its parent physical camera or encoder.
+- Suppressed child camera-disconnection problems while the mapped parent device is disconnected.
+- Added `{$AVIGILON.DEVICE.MONITORING.ENABLED}` for camera-only hosts; disabling it also bypasses parent suppression so camera outages remain visible.
+- Added `{$AVIGILON.CAMERA.PARENT.SUPPRESSION}` to independently control parent-device suppression.
+- Added `{$AVIGILON.HEALTH.ENABLED}` and disabled intensive per-device health requests by default.
+- Kept lightweight physical-device collection enabled for parent mapping and summary counts.
+
 ## 2.0.0 - 2026-09-14
 
 - Added paginated collection for Unity API list resources.

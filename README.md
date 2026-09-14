@@ -13,9 +13,10 @@ The template uses Unity 8 Integration Management client credentials. It does not
 - Total, online, disconnected, disabled, and unknown video-source counts
 - Low-level discovery of video sources
 - Individual camera-disconnection triggers with a configurable grace period
+- Parent-device-aware camera alert suppression
 - Camera status and diagnostic-error monitoring
 - Physical camera and encoder counts, inventory, and low-level discovery
-- Per-device connection, firmware, IP address, and health monitoring
+- Optional per-device connection, firmware, IP address, and health monitoring
 - Device health flags for error status, lost network, and prolonged errors
 - Expected camera/device count checks to detect removed resources
 - Server software display and full build versions
@@ -69,7 +70,10 @@ It requests scope `tq:api` and reads the Unity API Gateway resources under `/tq/
 | `{$AVIGILON.EXPECTED.CAMERA.COUNT}` | `0` | Minimum expected video-source count; zero disables the trigger |
 | `{$AVIGILON.EXPECTED.DEVICE.COUNT}` | `0` | Minimum expected physical-device count; zero disables the trigger |
 | `{$AVIGILON.CAMERA.OFFLINE.TIME}` | `2m` | Camera disconnection grace period |
+| `{$AVIGILON.CAMERA.PARENT.SUPPRESSION}` | `1` | Suppress camera alerts while the mapped parent device is disconnected |
+| `{$AVIGILON.DEVICE.MONITORING.ENABLED}` | `1` | Discover and alert on physical devices; set to `0` for camera-only monitoring |
 | `{$AVIGILON.DEVICE.OFFLINE.TIME}` | `2m` | Physical-device disconnection grace period |
+| `{$AVIGILON.HEALTH.ENABLED}` | `0` | Enable intensive per-device health requests; disabled by default |
 | `{$AVIGILON.HEALTH.INTERVAL}` | `10m` | Detailed physical-device health interval |
 | `{$AVIGILON.HEALTH.MAX.DEVICES}` | `50` | Devices checked per detailed-health poll; zero means all |
 | `{$AVIGILON.HEALTH.TIMEOUT}` | `60s` | Detailed-health collector timeout |
@@ -86,6 +90,10 @@ Each discovered camera and physical-device trigger depends on the applicable roo
 
 When one of those root conditions fails, Zabbix suppresses the dependent camera problems. This prevents a server outage from generating a separate notification for every camera.
 
+Camera disconnection triggers also inspect the lightweight connection state of their mapped parent physical device. If the device is disconnected, its child video-source problems remain closed and the physical-device problem is the single alert. Multi-channel cameras and encoders therefore do not create one notification per channel during a device outage.
+
+Set `{$AVIGILON.DEVICE.MONITORING.ENABLED}` to `0` for camera-only monitoring. This excludes physical devices from low-level discovery and automatically bypasses parent-device suppression, ensuring camera outages are still reported. The lightweight `/Devices` list remains part of the main collection because it supplies camera-to-device mapping and summary counts; it is one paginated collection request, not one request per device.
+
 ## Video sources versus physical devices
 
 Unity reports video data sources separately from physical cameras and encoders. A multi-sensor camera or encoder can provide several video sources, so the two totals are not expected to match.
@@ -95,11 +103,13 @@ Version 2 discovers both layers:
 - Video-source items monitor the status and diagnostic result of every view/channel.
 - Physical-device items monitor the camera or encoder connection, firmware, IP address, and detailed device health.
 
-Depending on the fault, Unity may report both a physical device and its video sources offline. If that produces more detail than your notification policy needs, route the `component: device` and `component: camera` event tags differently in Zabbix actions.
+When physical-device monitoring and parent suppression are enabled, a device outage creates the physical-device problem while its child video-source problems remain suppressed. If a video source disconnects while its parent device remains connected, the camera problem opens normally. An unknown or unmapped parent never suppresses a camera problem.
 
 ## Detailed health polling
 
-Unity exposes device health through one resource per physical device. The lower-frequency health collector therefore performs one health request for each checked device. It is separate from the one-minute availability poll and checks at most 50 devices by default.
+Unity exposes device health through one resource per physical device. For that reason, detailed health is disabled by default. Set `{$AVIGILON.HEALTH.ENABLED}` to `1` on a host to enable it. The lower-frequency collector then performs one health request for each checked device. It is separate from the one-minute availability poll and checks at most 50 devices by default.
+
+With detailed health disabled, the collector reports state `2` (disabled/not checked) and makes no per-device `/Health` requests. It still performs a low-frequency authentication and device-list request so existing dependent items remain supported. Detailed health also remains inactive when `{$AVIGILON.DEVICE.MONITORING.ENABLED}` is `0`.
 
 If the site contains more than the configured limit, the template records the skipped count and opens an informational capacity event. Increase the limit carefully, reduce the health polling frequency, or leave the remaining devices unchecked. A value of zero removes the limit but can exceed Zabbix's script timeout on large sites.
 
@@ -120,10 +130,10 @@ After linking the template, confirm in **Latest data** that:
 - Camera totals match Unity Video.
 - Physical-device totals match Unity Video.
 - Cameras with unknown state is `0`.
-- Device health collection successful is `1`.
-- Devices skipped by detailed-health limit is `0`, unless intentionally limited.
+- Device health collection successful is `2` when detailed health is disabled, or `1` after it is enabled.
+- Devices skipped by detailed-health limit is `0`, unless detailed health is enabled and intentionally limited.
 
-Perform a controlled camera disconnect and confirm that only its camera trigger opens after the configured grace period. Also test a server/API outage to verify that the dependency chain suppresses the individual camera notifications.
+Perform a controlled camera disconnect and confirm that only its camera trigger opens after the configured grace period. Then disconnect a physical device and confirm that its device problem opens without child camera problems. Also test a server/API outage to verify that the root dependency chain suppresses individual notifications.
 
 ## Security
 

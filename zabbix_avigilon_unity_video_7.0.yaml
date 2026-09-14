@@ -15,9 +15,10 @@ zabbix_export:
         credentials flow. No Unity username or password is required.
 
         Version 2 adds physical-device discovery, diagnostic and device-health checks,
-        expected-count monitoring, pagination, and server software inventory. Override
-        credential macros on each host. Camera and device triggers depend on root
-        server/API/site triggers to prevent alert storms during recorder outages.
+        expected-count monitoring, pagination, and server software inventory. Version
+        2.1 adds parent-device-aware camera suppression and independent controls for
+        physical-device discovery and detailed health. Detailed per-device health is
+        disabled by default. Override credential macros on each host.
       groups:
         - name: Templates/Video surveillance
       items:
@@ -139,6 +140,24 @@ zabbix_export:
                 return 2;
             }
 
+            function parentDeviceId(dataSourceId, deviceById) {
+                var id = String(dataSourceId || '');
+                if (deviceById[id]) {
+                    return id;
+                }
+
+                // Unity video-source IDs add a .camNN channel segment to the
+                // corresponding physical-device ID.
+                var match = id.match(/^(.*)\.cam[0-9]+(\+\+.*)$/i);
+                if (match) {
+                    var candidate = match[1] + match[2];
+                    if (deviceById[candidate]) {
+                        return candidate;
+                    }
+                }
+                return '';
+            }
+
             var webBase = cleanUrl(p.web_base_url);
             var apiBase = cleanUrl(p.api_base_url);
             var healthReq = new HttpRequest();
@@ -236,6 +255,47 @@ zabbix_export:
                     out.site.reachable = 0;
                 }
 
+                var devices = requestCollection(
+                    apiReq,
+                    apiBase + '/tq/v2/Devices',
+                    'Devices endpoint'
+                );
+                var deviceById = {};
+                for (var d = 0; d < devices.length; d++) {
+                    if (!devices[d].Id) {
+                        continue;
+                    }
+
+                    var online = deviceState(devices[d]);
+                    var deviceResult = {
+                        id: String(devices[d].Id),
+                        name: String(devices[d].Name || devices[d].Id),
+                        type: String(devices[d].Type || 'Unknown'),
+                        vendor: String(devices[d].Vendor || 'Unknown'),
+                        model: String(devices[d].Model || 'Unknown'),
+                        driver: String(devices[d].DriverType || 'Unknown'),
+                        version: String(devices[d].Version || 'Unknown'),
+                        ip: String(devices[d].IpAddressInUse || ''),
+                        state: String(devices[d].State || 'Unknown'),
+                        connection_status: String(devices[d].ConnectionStatus || 'Unknown'),
+                        online: online,
+                        monitoring_enabled: String(p.device_monitoring_enabled)
+                    };
+                    out.devices.push(deviceResult);
+                    deviceById[deviceResult.id] = deviceResult;
+
+                    if (online === 1) {
+                        out.device_count.connected++;
+                    }
+                    else if (online === 0) {
+                        out.device_count.disconnected++;
+                    }
+                    else {
+                        out.device_count.unknown++;
+                    }
+                }
+                out.device_count.total = out.devices.length;
+
                 var cameras = requestCollection(
                     apiReq,
                     apiBase + '/tq/v2/DataSources',
@@ -249,13 +309,18 @@ zabbix_export:
 
                     var state = cameraState(cameras[i].Status);
                     var diagnosticError = String(cameras[i].Error || 'Unknown');
+                    var parentId = parentDeviceId(cameras[i].Id, deviceById);
+                    var parent = parentId ? deviceById[parentId] : null;
                     out.cameras.push({
                         id: String(cameras[i].Id),
                         name: String(cameras[i].Name || cameras[i].Id),
                         state: String(cameras[i].Status || 'Unknown'),
                         online: state,
                         diagnostic_error: diagnosticError,
-                        diagnostic_ok: diagnosticError.toUpperCase() === 'NOERROR' ? 1 : 0
+                        diagnostic_ok: diagnosticError.toUpperCase() === 'NOERROR' ? 1 : 0,
+                        parent_device_id: parentId,
+                        parent_device_name: parent ? parent.name : 'Unmapped',
+                        parent_device_online: parent ? parent.online : 2
                     });
 
                     if (state === 1) {
@@ -273,43 +338,6 @@ zabbix_export:
                 }
 
                 out.camera_count.total = out.cameras.length;
-
-                var devices = requestCollection(
-                    apiReq,
-                    apiBase + '/tq/v2/Devices',
-                    'Devices endpoint'
-                );
-                for (var d = 0; d < devices.length; d++) {
-                    if (!devices[d].Id) {
-                        continue;
-                    }
-
-                    var online = deviceState(devices[d]);
-                    out.devices.push({
-                        id: String(devices[d].Id),
-                        name: String(devices[d].Name || devices[d].Id),
-                        type: String(devices[d].Type || 'Unknown'),
-                        vendor: String(devices[d].Vendor || 'Unknown'),
-                        model: String(devices[d].Model || 'Unknown'),
-                        driver: String(devices[d].DriverType || 'Unknown'),
-                        version: String(devices[d].Version || 'Unknown'),
-                        ip: String(devices[d].IpAddressInUse || ''),
-                        state: String(devices[d].State || 'Unknown'),
-                        connection_status: String(devices[d].ConnectionStatus || 'Unknown'),
-                        online: online
-                    });
-
-                    if (online === 1) {
-                        out.device_count.connected++;
-                    }
-                    else if (online === 0) {
-                        out.device_count.disconnected++;
-                    }
-                    else {
-                        out.device_count.unknown++;
-                    }
-                }
-                out.device_count.total = out.devices.length;
                 out.api.ok = 1;
             }
             catch (e) {
@@ -324,10 +352,12 @@ zabbix_export:
               value: '{$AVIGILON.CLIENT.ID}'
             - name: client_secret
               value: '{$AVIGILON.CLIENT.SECRET}'
+            - name: device_monitoring_enabled
+              value: '{$AVIGILON.DEVICE.MONITORING.ENABLED}'
             - name: web_base_url
               value: 'https://{HOST.CONN}:{$AVIGILON.WEB.PORT}'
           timeout: '{$AVIGILON.TIMEOUT}'
-          description: 'Collects service, site, server, software, camera, and physical-device information. Collection endpoints are paginated.'
+          description: 'Collects service, site, server, software, camera, and lightweight physical-device information. The device list is also used to suppress child camera alerts when their parent device is offline. Collection endpoints are paginated.'
           tags:
             - tag: component
               value: raw
@@ -431,6 +461,9 @@ zabbix_export:
                     'Devices endpoint'
                 );
 
+                var healthEnabled = String(p.health_enabled) === '1' &&
+                    String(p.device_monitoring_enabled) === '1';
+
                 var configuredLimit = parseInt(p.health_limit, 10);
                 if (isNaN(configuredLimit) || configuredLimit < 0) {
                     configuredLimit = 50;
@@ -443,13 +476,18 @@ zabbix_export:
                     var result = {
                         id: String(devices[i].Id),
                         name: String(devices[i].Name || devices[i].Id),
-                        checked: i < checkLimit ? 1 : 0,
+                        checked: healthEnabled && i < checkLimit ? 1 : 0,
                         request_ok: 1,
                         health_ok: 2,
-                        error_status: 'NotChecked',
+                        error_status: healthEnabled ? 'NotChecked' : 'Disabled',
                         lost_network: 0,
                         prolonged_error: 0
                     };
+
+                    if (!healthEnabled) {
+                        out.health.push(result);
+                        continue;
+                    }
 
                     if (i >= checkLimit) {
                         out.device_count.skipped++;
@@ -482,7 +520,7 @@ zabbix_export:
                     out.health.push(result);
                 }
 
-                out.api.ok = out.device_count.errors === 0 ? 1 : 0;
+                out.api.ok = healthEnabled ? (out.device_count.errors === 0 ? 1 : 0) : 2;
                 if (out.device_count.errors > 0) {
                     out.error = out.device_count.errors + ' device health request(s) failed';
                 }
@@ -499,10 +537,14 @@ zabbix_export:
               value: '{$AVIGILON.CLIENT.ID}'
             - name: client_secret
               value: '{$AVIGILON.CLIENT.SECRET}'
+            - name: device_monitoring_enabled
+              value: '{$AVIGILON.DEVICE.MONITORING.ENABLED}'
+            - name: health_enabled
+              value: '{$AVIGILON.HEALTH.ENABLED}'
             - name: health_limit
               value: '{$AVIGILON.HEALTH.MAX.DEVICES}'
           timeout: '{$AVIGILON.HEALTH.TIMEOUT}'
-          description: 'Collects detailed health for physical devices at a lower frequency. A limit prevents large sites from exceeding the script timeout; zero checks all devices.'
+          description: 'Collects detailed health for physical devices at a lower frequency when enabled. With detailed health disabled, it makes no per-device Health requests and reports state 2. A limit prevents large sites from exceeding the script timeout; zero checks all devices.'
           tags:
             - tag: component
               value: raw
@@ -743,6 +785,7 @@ zabbix_export:
           type: DEPENDENT
           key: avigilon.device.health.api.ok
           trends: '365d'
+          description: '0=collection failed, 1=collection successful, 2=detailed health disabled.'
           preprocessing:
             - type: JSONPATH
               parameters:
@@ -754,7 +797,7 @@ zabbix_export:
               value: availability
           triggers:
             - uuid: 179acf72ebda4f6080b81ada1c64c741
-              expression: 'count(/Avigilon Unity Video by HTTP/avigilon.device.health.api.ok,#2)=2 and max(/Avigilon Unity Video by HTTP/avigilon.device.health.api.ok,#2)=0 or nodata(/Avigilon Unity Video by HTTP/avigilon.device.health.get,{$AVIGILON.HEALTH.NODATA.TIME})=1'
+              expression: '{$AVIGILON.DEVICE.MONITORING.ENABLED}=1 and {$AVIGILON.HEALTH.ENABLED}=1 and (count(/Avigilon Unity Video by HTTP/avigilon.device.health.api.ok,#2)=2 and max(/Avigilon Unity Video by HTTP/avigilon.device.health.api.ok,#2)=0 or nodata(/Avigilon Unity Video by HTTP/avigilon.device.health.get,{$AVIGILON.HEALTH.NODATA.TIME})=1)'
               name: 'Avigilon: Physical-device health collection failed'
               priority: WARNING
               description: 'Two consecutive detailed health collections failed, or the health collector stopped returning data.'
@@ -812,13 +855,13 @@ zabbix_export:
               value: health
           triggers:
             - uuid: d29a81160e2946cfabd31daa0962f19f
-              expression: 'last(/Avigilon Unity Video by HTTP/avigilon.device.health.count.skipped)>0'
+              expression: '{$AVIGILON.DEVICE.MONITORING.ENABLED}=1 and {$AVIGILON.HEALTH.ENABLED}=1 and last(/Avigilon Unity Video by HTTP/avigilon.device.health.count.skipped)>0'
               name: 'Avigilon: Some physical devices are excluded from detailed health checks'
               priority: INFO
               description: 'Raise the health maximum-devices macro carefully, reduce polling frequency, or leave this as an informational capacity warning.'
               dependencies:
                 - name: 'Avigilon: Physical-device health collection failed'
-                  expression: 'count(/Avigilon Unity Video by HTTP/avigilon.device.health.api.ok,#2)=2 and max(/Avigilon Unity Video by HTTP/avigilon.device.health.api.ok,#2)=0 or nodata(/Avigilon Unity Video by HTTP/avigilon.device.health.get,{$AVIGILON.HEALTH.NODATA.TIME})=1'
+                  expression: '{$AVIGILON.DEVICE.MONITORING.ENABLED}=1 and {$AVIGILON.HEALTH.ENABLED}=1 and (count(/Avigilon Unity Video by HTTP/avigilon.device.health.api.ok,#2)=2 and max(/Avigilon Unity Video by HTTP/avigilon.device.health.api.ok,#2)=0 or nodata(/Avigilon Unity Video by HTTP/avigilon.device.health.get,{$AVIGILON.HEALTH.NODATA.TIME})=1)'
               tags:
                 - tag: scope
                   value: capacity
@@ -965,7 +1008,7 @@ zabbix_export:
               value: device
           triggers:
             - uuid: 7546285749c448e5a8218ab7c7ca73b0
-              expression: '{$AVIGILON.EXPECTED.DEVICE.COUNT}>0 and max(/Avigilon Unity Video by HTTP/avigilon.device.count.total,{$AVIGILON.FAIL.TIME})<{$AVIGILON.EXPECTED.DEVICE.COUNT}'
+              expression: '{$AVIGILON.DEVICE.MONITORING.ENABLED}=1 and {$AVIGILON.EXPECTED.DEVICE.COUNT}>0 and max(/Avigilon Unity Video by HTTP/avigilon.device.count.total,{$AVIGILON.FAIL.TIME})<{$AVIGILON.EXPECTED.DEVICE.COUNT}'
               name: 'Avigilon: Physical-device count is below the expected minimum'
               priority: HIGH
               description: 'The number of physical cameras and encoders is below the configured expected count. Set the macro to zero to disable this check.'
@@ -1063,11 +1106,11 @@ zabbix_export:
                   value: camera
               trigger_prototypes:
                 - uuid: 38998136a8ec4dbab403936bbff637f2
-                  expression: 'max(/Avigilon Unity Video by HTTP/avigilon.camera.online[{#CAMERA.ID}],{$AVIGILON.CAMERA.OFFLINE.TIME})=0 and min(/Avigilon Unity Video by HTTP/avigilon.camera.online[{#CAMERA.ID}],{$AVIGILON.CAMERA.OFFLINE.TIME})=0'
+                  expression: 'max(/Avigilon Unity Video by HTTP/avigilon.camera.online[{#CAMERA.ID}],{$AVIGILON.CAMERA.OFFLINE.TIME})=0 and min(/Avigilon Unity Video by HTTP/avigilon.camera.online[{#CAMERA.ID}],{$AVIGILON.CAMERA.OFFLINE.TIME})=0 and ({$AVIGILON.DEVICE.MONITORING.ENABLED}=0 or {$AVIGILON.CAMERA.PARENT.SUPPRESSION}=0 or last(/Avigilon Unity Video by HTTP/avigilon.camera.parent_device.online[{#CAMERA.ID}])<>0)'
                   name: 'Avigilon: Camera {#CAMERA.NAME} is disconnected'
                   event_name: 'Avigilon camera {#CAMERA.NAME} is disconnected'
                   priority: HIGH
-                  description: 'Unity reports this camera offline for the configured grace period.'
+                  description: 'Unity reports this camera offline for the configured grace period. When parent-device suppression and physical-device monitoring are enabled, this problem opens only while the parent device is not disconnected.'
                   dependencies:
                     - name: 'Avigilon: API authentication or camera collection failed'
                       expression: 'max(/Avigilon Unity Video by HTTP/avigilon.api.ok,{$AVIGILON.FAIL.TIME})=0'
@@ -1078,8 +1121,29 @@ zabbix_export:
                   tags:
                     - tag: camera
                       value: '{#CAMERA.NAME}'
+                    - tag: device
+                      value: '{#CAMERA.DEVICE.NAME}'
                     - tag: scope
                       value: availability
+            - uuid: e0f3ccbda9ba446b9c20617204179306
+              name: 'Avigilon: Camera {#CAMERA.NAME}: Parent physical device connection state'
+              type: DEPENDENT
+              key: 'avigilon.camera.parent_device.online[{#CAMERA.ID}]'
+              trends: '365d'
+              description: '0=parent physical device disconnected, 1=connected, 2=unknown or the video source could not be mapped. Only state 0 suppresses the child camera-disconnection problem.'
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - '$.cameras[?(@.id == "{#CAMERA.ID}")].parent_device_online.first()'
+              master_item:
+                key: avigilon.unity.get
+              tags:
+                - tag: camera
+                  value: '{#CAMERA.NAME}'
+                - tag: component
+                  value: device
+                - tag: device
+                  value: '{#CAMERA.DEVICE.NAME}'
             - uuid: 1544b1db400041e691bc0f4f0d5711d8
               name: 'Avigilon: Camera {#CAMERA.NAME}: Unity status'
               type: DEPENDENT
@@ -1152,6 +1216,10 @@ zabbix_export:
           master_item:
             key: avigilon.unity.get
           lld_macro_paths:
+            - lld_macro: '{#CAMERA.DEVICE.ID}'
+              path: $.parent_device_id
+            - lld_macro: '{#CAMERA.DEVICE.NAME}'
+              path: $.parent_device_name
             - lld_macro: '{#CAMERA.ID}'
               path: $.id
             - lld_macro: '{#CAMERA.NAME}'
@@ -1165,6 +1233,11 @@ zabbix_export:
           type: DEPENDENT
           key: avigilon.device.discovery
           lifetime: 30d
+          filter:
+            evaltype: AND
+            conditions:
+              - macro: '{#DEVICE.MONITORING}'
+                value: '^1$'
           item_prototypes:
             - uuid: 428cba96e2fe41f192acd74ee9c1f253
               name: 'Avigilon: Physical device {#DEVICE.NAME}: Connection state'
@@ -1185,7 +1258,7 @@ zabbix_export:
                   value: '{#DEVICE.NAME}'
               trigger_prototypes:
                 - uuid: bd63dc4a638f4d1fb7e5f7868369731d
-                  expression: 'max(/Avigilon Unity Video by HTTP/avigilon.device.online[{#DEVICE.ID}],{$AVIGILON.DEVICE.OFFLINE.TIME})=0 and min(/Avigilon Unity Video by HTTP/avigilon.device.online[{#DEVICE.ID}],{$AVIGILON.DEVICE.OFFLINE.TIME})=0'
+                  expression: '{$AVIGILON.DEVICE.MONITORING.ENABLED}=1 and max(/Avigilon Unity Video by HTTP/avigilon.device.online[{#DEVICE.ID}],{$AVIGILON.DEVICE.OFFLINE.TIME})=0 and min(/Avigilon Unity Video by HTTP/avigilon.device.online[{#DEVICE.ID}],{$AVIGILON.DEVICE.OFFLINE.TIME})=0'
                   name: 'Avigilon: Physical device {#DEVICE.NAME} is disconnected'
                   priority: HIGH
                   description: 'Unity reports the physical camera or encoder disconnected for the configured grace period.'
@@ -1239,7 +1312,7 @@ zabbix_export:
                   value: '{#DEVICE.NAME}'
               trigger_prototypes:
                 - uuid: c8f590badf9c484ead225b65fcd592c7
-                  expression: 'last(/Avigilon Unity Video by HTTP/avigilon.device.version[{#DEVICE.ID}],#1)<>last(/Avigilon Unity Video by HTTP/avigilon.device.version[{#DEVICE.ID}],#2)'
+                  expression: '{$AVIGILON.DEVICE.MONITORING.ENABLED}=1 and last(/Avigilon Unity Video by HTTP/avigilon.device.version[{#DEVICE.ID}],#1)<>last(/Avigilon Unity Video by HTTP/avigilon.device.version[{#DEVICE.ID}],#2)'
                   name: 'Avigilon: Physical device {#DEVICE.NAME} firmware changed'
                   priority: INFO
                   description: 'Informational event recording a detected firmware change.'
@@ -1288,13 +1361,13 @@ zabbix_export:
                   value: '{#DEVICE.NAME}'
               trigger_prototypes:
                 - uuid: 8ab3060ae6b34f529442347afbbba6fb
-                  expression: 'max(/Avigilon Unity Video by HTTP/avigilon.device.health.ok[{#DEVICE.ID}],#2)=0 and min(/Avigilon Unity Video by HTTP/avigilon.device.health.ok[{#DEVICE.ID}],#2)=0'
+                  expression: '{$AVIGILON.DEVICE.MONITORING.ENABLED}=1 and {$AVIGILON.HEALTH.ENABLED}=1 and max(/Avigilon Unity Video by HTTP/avigilon.device.health.ok[{#DEVICE.ID}],#2)=0 and min(/Avigilon Unity Video by HTTP/avigilon.device.health.ok[{#DEVICE.ID}],#2)=0'
                   name: 'Avigilon: Physical device {#DEVICE.NAME} reports a health problem'
                   priority: AVERAGE
                   description: 'The device ErrorStatus is not NoError, it reports a lost network connection or prolonged error, or its health request failed.'
                   dependencies:
                     - name: 'Avigilon: Physical-device health collection failed'
-                      expression: 'count(/Avigilon Unity Video by HTTP/avigilon.device.health.api.ok,#2)=2 and max(/Avigilon Unity Video by HTTP/avigilon.device.health.api.ok,#2)=0 or nodata(/Avigilon Unity Video by HTTP/avigilon.device.health.get,{$AVIGILON.HEALTH.NODATA.TIME})=1'
+                      expression: '{$AVIGILON.DEVICE.MONITORING.ENABLED}=1 and {$AVIGILON.HEALTH.ENABLED}=1 and (count(/Avigilon Unity Video by HTTP/avigilon.device.health.api.ok,#2)=2 and max(/Avigilon Unity Video by HTTP/avigilon.device.health.api.ok,#2)=0 or nodata(/Avigilon Unity Video by HTTP/avigilon.device.health.get,{$AVIGILON.HEALTH.NODATA.TIME})=1)'
                     - name: 'Avigilon: API authentication or camera collection failed'
                       expression: 'max(/Avigilon Unity Video by HTTP/avigilon.api.ok,{$AVIGILON.FAIL.TIME})=0'
                     - name: 'Avigilon: Unity server or Web Endpoint is unavailable'
@@ -1379,6 +1452,8 @@ zabbix_export:
               path: $.id
             - lld_macro: '{#DEVICE.MODEL}'
               path: $.model
+            - lld_macro: '{#DEVICE.MONITORING}'
+              path: $.monitoring_enabled
             - lld_macro: '{#DEVICE.NAME}'
               path: $.name
             - lld_macro: '{#DEVICE.TYPE}'
@@ -1396,6 +1471,9 @@ zabbix_export:
         - macro: '{$AVIGILON.CAMERA.OFFLINE.TIME}'
           value: 2m
           description: 'A camera must remain offline for this long before alerting.'
+        - macro: '{$AVIGILON.CAMERA.PARENT.SUPPRESSION}'
+          value: '1'
+          description: 'Set to 1 to suppress a camera-disconnection problem while its mapped parent physical device is disconnected. Requires physical-device monitoring to be enabled.'
         - macro: '{$AVIGILON.CLIENT.ID}'
           value: CHANGE_ME
           description: 'Client ID created in Unity Integration Management. Override on each host.'
@@ -1406,6 +1484,9 @@ zabbix_export:
         - macro: '{$AVIGILON.DEVICE.OFFLINE.TIME}'
           value: 2m
           description: 'A physical camera or encoder must remain offline for this long before alerting.'
+        - macro: '{$AVIGILON.DEVICE.MONITORING.ENABLED}'
+          value: '1'
+          description: 'Set to 1 to discover and alert on physical devices. Set to 0 to suppress physical-device discovery and make camera alerts operate independently.'
         - macro: '{$AVIGILON.EXPECTED.CAMERA.COUNT}'
           value: '0'
           description: 'Minimum expected video-source count. Zero disables the count trigger.'
@@ -1421,6 +1502,9 @@ zabbix_export:
         - macro: '{$AVIGILON.HEALTH.INTERVAL}'
           value: 10m
           description: 'Detailed physical-device health polling interval.'
+        - macro: '{$AVIGILON.HEALTH.ENABLED}'
+          value: '0'
+          description: 'Set to 1 to enable per-device Health API requests. Disabled by default because each checked physical device requires a separate request.'
         - macro: '{$AVIGILON.HEALTH.MAX.DEVICES}'
           value: '50'
           description: 'Maximum physical devices checked per detailed-health poll. Zero checks all devices; raise cautiously.'
