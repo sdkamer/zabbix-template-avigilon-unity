@@ -1,0 +1,560 @@
+zabbix_export:
+  version: '7.0'
+  template_groups:
+    - uuid: 7fcd3ad8d391457296e7623673989ad3
+      name: Templates/Video surveillance
+  templates:
+    - uuid: e8830c91e726499889a026c210b0bee0
+      template: 'Avigilon Unity Video by HTTP'
+      name: 'Avigilon Unity Video by HTTP'
+      description: |
+        Monitors Avigilon Unity Video through the Unity API Gateway and Web Endpoint.
+
+        Tested against Unity Video 8.8.0.22, Web Endpoint build 36.0.2. Authentication
+        uses an Integration Management client ID and secret with the OAuth 2.0 client
+        credentials flow. No Unity username or password is required.
+
+        Override credential macros on each host. The camera and site triggers depend on
+        the server/API availability triggers so a recorder outage does not generate one
+        notification for every camera.
+      groups:
+        - name: Templates/Video surveillance
+      items:
+        - uuid: 23059438e1ce452b8e9d4e7655faaa4e
+          name: 'Avigilon: Collect Unity data'
+          type: SCRIPT
+          key: avigilon.unity.get
+          delay: '{$AVIGILON.UPDATE.INTERVAL}'
+          history: '1d'
+          trends: '0'
+          value_type: TEXT
+          params: |
+            var p = JSON.parse(value);
+            var out = {
+                server: {available: 0, health_good: 0, health: 'UNKNOWN'},
+                api: {ok: 0},
+                site: {reachable: 0, count: 0},
+                camera_count: {total: 0, connected: 0, disconnected: 0, disabled: 0, unknown: 0},
+                cameras: [],
+                error: ''
+            };
+
+            function cleanUrl(url) {
+                return String(url).replace(/\/+$/, '');
+            }
+
+            function parseJson(body, label) {
+                try {
+                    return JSON.parse(body);
+                }
+                catch (e) {
+                    throw label + ' returned invalid JSON';
+                }
+            }
+
+            function requestJson(req, method, url, body, label) {
+                var response;
+                if (method === 'POST') {
+                    response = req.post(url, body);
+                }
+                else {
+                    response = req.get(url);
+                }
+
+                var status = req.getStatus();
+                if (status < 200 || status >= 300) {
+                    throw label + ' returned HTTP ' + status;
+                }
+
+                var decoded = parseJson(response, label);
+                if (decoded.status && decoded.status !== 'success') {
+                    throw label + ' failed: ' + (decoded.message || decoded.status);
+                }
+                return decoded;
+            }
+
+            function cameraState(status) {
+                var state = String(status || 'Unknown').toUpperCase();
+                if (state === 'ONLINE' || state === 'CONNECTED') {
+                    return 1;
+                }
+                if (state === 'DISCONNECTED' || state === 'OFFLINE') {
+                    return 0;
+                }
+                if (state === 'DISABLED') {
+                    return 2;
+                }
+                // Unknown states do not create false disconnect alarms.
+                return 3;
+            }
+
+            var webBase = cleanUrl(p.web_base_url);
+            var apiBase = cleanUrl(p.api_base_url);
+            var healthReq = new HttpRequest();
+            healthReq.addHeader('Accept: application/json');
+
+            try {
+                var health = requestJson(
+                    healthReq,
+                    'GET',
+                    webBase + '/mt/api/rest/v1/health?v',
+                    null,
+                    'Health endpoint'
+                );
+
+                out.server.available = 1;
+                out.server.health = health.service.status.state || 'UNKNOWN';
+                out.server.health_good = out.server.health === 'GOOD' ? 1 : 0;
+                out.server.acc_version = health.service.custom.accVersion || '';
+                out.server.web_endpoint_version = health.service.version || '';
+                out.server.hostname = health.service.custom.hostname || '';
+                out.server.start_time = health.service.custom.process.startTime || 0;
+            }
+            catch (e) {
+                out.error = String(e);
+                return JSON.stringify(out);
+            }
+
+            try {
+                if (!p.client_id || !p.client_secret ||
+                        p.client_id === 'CHANGE_ME' || p.client_secret === 'CHANGE_ME') {
+                    throw 'Set the Avigilon client ID and client secret macros on this host';
+                }
+
+                var tokenReq = new HttpRequest();
+                tokenReq.addHeader('Accept: application/json');
+                tokenReq.addHeader('Content-Type: application/x-www-form-urlencoded');
+                var tokenResponse = requestJson(
+                    tokenReq,
+                    'POST',
+                    apiBase + '/connect/token',
+                    'grant_type=client_credentials&scope=tq%3Aapi&client_id=' +
+                        encodeURIComponent(p.client_id) + '&client_secret=' +
+                        encodeURIComponent(p.client_secret),
+                    'OAuth token endpoint'
+                );
+                if (!tokenResponse.access_token) {
+                    throw 'OAuth token endpoint returned no access token';
+                }
+
+                var apiReq = new HttpRequest();
+                apiReq.addHeader('Accept: application/json');
+                apiReq.addHeader('Authorization: Bearer ' + tokenResponse.access_token);
+
+                var serversResponse = requestJson(
+                    apiReq,
+                    'GET',
+                    apiBase + '/tq/v2/Servers',
+                    null,
+                    'Servers endpoint'
+                );
+                var servers = serversResponse.Collection || [];
+                for (var s = 0; s < servers.length; s++) {
+                    if (String(servers[s].State).toUpperCase() === 'AVAILABLE') {
+                        out.site.reachable = 1;
+                        break;
+                    }
+                }
+
+                var sitesResponse = requestJson(
+                    apiReq,
+                    'GET',
+                    apiBase + '/tq/v2/Sites',
+                    null,
+                    'Sites endpoint'
+                );
+                var sites = sitesResponse.Collection || [];
+                out.site.count = sites.length;
+                if (sites.length === 0) {
+                    out.site.reachable = 0;
+                }
+
+                var cameraResponse = requestJson(
+                    apiReq,
+                    'GET',
+                    apiBase + '/tq/v2/DataSources',
+                    null,
+                    'DataSources endpoint'
+                );
+                var cameras = cameraResponse.Collection || [];
+
+                for (var i = 0; i < cameras.length; i++) {
+                    if (String(cameras[i].Type).toUpperCase() !== 'VIDEO' || !cameras[i].Id) {
+                        continue;
+                    }
+
+                    var state = cameraState(cameras[i].Status);
+                    out.cameras.push({
+                        id: String(cameras[i].Id),
+                        name: String(cameras[i].Name || cameras[i].Id),
+                        state: String(cameras[i].Status || 'Unknown'),
+                        online: state
+                    });
+
+                    if (state === 1) {
+                        out.camera_count.connected++;
+                    }
+                    else if (state === 0) {
+                        out.camera_count.disconnected++;
+                    }
+                    else if (state === 2) {
+                        out.camera_count.disabled++;
+                    }
+                    else {
+                        out.camera_count.unknown++;
+                    }
+                }
+
+                out.camera_count.total = out.cameras.length;
+                out.api.ok = 1;
+            }
+            catch (e) {
+                out.error = String(e);
+            }
+
+            return JSON.stringify(out);
+          parameters:
+            - name: api_base_url
+              value: 'https://{HOST.CONN}:{$AVIGILON.API.PORT}'
+            - name: client_id
+              value: '{$AVIGILON.CLIENT.ID}'
+            - name: client_secret
+              value: '{$AVIGILON.CLIENT.SECRET}'
+            - name: web_base_url
+              value: 'https://{HOST.CONN}:{$AVIGILON.WEB.PORT}'
+          timeout: '{$AVIGILON.TIMEOUT}'
+          description: 'Collects health, site, and camera information in one request cycle.'
+          tags:
+            - tag: component
+              value: raw
+        - uuid: 4d0c4ea38c6146cebe1d5d9739769fce
+          name: 'Avigilon: Server available'
+          type: DEPENDENT
+          key: avigilon.server.available
+          trends: '365d'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.server.available
+          master_item:
+            key: avigilon.unity.get
+          tags:
+            - tag: component
+              value: availability
+          triggers:
+            - uuid: ff4d3c83a365411fb1367b4806277efd
+              expression: 'max(/Avigilon Unity Video by HTTP/avigilon.server.available,{$AVIGILON.FAIL.TIME})=0 or nodata(/Avigilon Unity Video by HTTP/avigilon.unity.get,{$AVIGILON.NODATA.TIME})=1'
+              name: 'Avigilon: Unity server or Web Endpoint is unavailable'
+              priority: HIGH
+              description: 'The public Web Endpoint health request is failing. Camera triggers depend on this problem to prevent an alert storm.'
+              tags:
+                - tag: scope
+                  value: availability
+        - uuid: 011f1b41c6b34c3d8680d27bc1226352
+          name: 'Avigilon: Web Endpoint health is good'
+          type: DEPENDENT
+          key: avigilon.server.health.good
+          trends: '365d'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.server.health_good
+          master_item:
+            key: avigilon.unity.get
+          tags:
+            - tag: component
+              value: health
+          triggers:
+            - uuid: f566d24ad24948b58b6fd9ee86044960
+              expression: 'max(/Avigilon Unity Video by HTTP/avigilon.server.health.good,{$AVIGILON.FAIL.TIME})=0'
+              name: 'Avigilon: Web Endpoint health is not GOOD'
+              priority: HIGH
+              dependencies:
+                - name: 'Avigilon: Unity server or Web Endpoint is unavailable'
+                  expression: 'max(/Avigilon Unity Video by HTTP/avigilon.server.available,{$AVIGILON.FAIL.TIME})=0 or nodata(/Avigilon Unity Video by HTTP/avigilon.unity.get,{$AVIGILON.NODATA.TIME})=1'
+              tags:
+                - tag: scope
+                  value: health
+        - uuid: 11be5ccc5f8d49018c6b58a1ef2f4c56
+          name: 'Avigilon: API collection successful'
+          type: DEPENDENT
+          key: avigilon.api.ok
+          trends: '365d'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.api.ok
+          master_item:
+            key: avigilon.unity.get
+          tags:
+            - tag: component
+              value: availability
+          triggers:
+            - uuid: 4f4907ebb07f4131951be089f8be3239
+              expression: 'max(/Avigilon Unity Video by HTTP/avigilon.api.ok,{$AVIGILON.FAIL.TIME})=0'
+              name: 'Avigilon: API authentication or camera collection failed'
+              priority: AVERAGE
+              description: 'Check the error item and the per-host credential macros.'
+              dependencies:
+                - name: 'Avigilon: Unity server or Web Endpoint is unavailable'
+                  expression: 'max(/Avigilon Unity Video by HTTP/avigilon.server.available,{$AVIGILON.FAIL.TIME})=0 or nodata(/Avigilon Unity Video by HTTP/avigilon.unity.get,{$AVIGILON.NODATA.TIME})=1'
+              tags:
+                - tag: scope
+                  value: authentication
+        - uuid: 6feaeda1909c4a01a40b7609f485abf3
+          name: 'Avigilon: Site reachable'
+          type: DEPENDENT
+          key: avigilon.site.reachable
+          trends: '365d'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.site.reachable
+          master_item:
+            key: avigilon.unity.get
+          tags:
+            - tag: component
+              value: site
+          triggers:
+            - uuid: 3e33b6b645e94d6c8900ae47f7e8db37
+              expression: 'max(/Avigilon Unity Video by HTTP/avigilon.site.reachable,{$AVIGILON.FAIL.TIME})=0'
+              name: 'Avigilon: No Unity site is reachable'
+              priority: HIGH
+              dependencies:
+                - name: 'Avigilon: Unity server or Web Endpoint is unavailable'
+                  expression: 'max(/Avigilon Unity Video by HTTP/avigilon.server.available,{$AVIGILON.FAIL.TIME})=0 or nodata(/Avigilon Unity Video by HTTP/avigilon.unity.get,{$AVIGILON.NODATA.TIME})=1'
+              tags:
+                - tag: scope
+                  value: site
+        - uuid: a985619ea6f24cca8e04e001704198dd
+          name: 'Avigilon: Collection error'
+          type: DEPENDENT
+          key: avigilon.error
+          history: '7d'
+          trends: '0'
+          value_type: TEXT
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.error
+          master_item:
+            key: avigilon.unity.get
+          tags:
+            - tag: component
+              value: error
+        - uuid: 69249848ad2a4e25ae626d785361c446
+          name: 'Avigilon: ACC version'
+          type: DEPENDENT
+          key: avigilon.acc.version
+          history: '7d'
+          trends: '0'
+          value_type: CHAR
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.server.acc_version
+              error_handler: CUSTOM_VALUE
+              error_handler_params: UNKNOWN
+          master_item:
+            key: avigilon.unity.get
+          tags:
+            - tag: component
+              value: inventory
+        - uuid: 0bab5c1af4d140169e15ab9ec6c59f09
+          name: 'Avigilon: Web Endpoint version'
+          type: DEPENDENT
+          key: avigilon.webendpoint.version
+          history: '7d'
+          trends: '0'
+          value_type: CHAR
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.server.web_endpoint_version
+              error_handler: CUSTOM_VALUE
+              error_handler_params: UNKNOWN
+          master_item:
+            key: avigilon.unity.get
+          tags:
+            - tag: component
+              value: inventory
+        - uuid: 2f542612bf4f4108b457be028c786063
+          name: 'Avigilon: Cameras total'
+          type: DEPENDENT
+          key: avigilon.camera.count.total
+          trends: '365d'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.camera_count.total
+          master_item:
+            key: avigilon.unity.get
+          tags:
+            - tag: component
+              value: cameras
+        - uuid: 509842fc4faf4fa994651f582b165677
+          name: 'Avigilon: Cameras connected'
+          type: DEPENDENT
+          key: avigilon.camera.count.connected
+          trends: '365d'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.camera_count.connected
+          master_item:
+            key: avigilon.unity.get
+          tags:
+            - tag: component
+              value: cameras
+        - uuid: a2956cf3985944abb949c9ff1c6bbb09
+          name: 'Avigilon: Cameras disconnected'
+          type: DEPENDENT
+          key: avigilon.camera.count.disconnected
+          trends: '365d'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.camera_count.disconnected
+          master_item:
+            key: avigilon.unity.get
+          tags:
+            - tag: component
+              value: cameras
+        - uuid: 25f0991e2de54e9c9d21e8c2d82a915a
+          name: 'Avigilon: Cameras with unknown state'
+          type: DEPENDENT
+          key: avigilon.camera.count.unknown
+          trends: '365d'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.camera_count.unknown
+          master_item:
+            key: avigilon.unity.get
+          tags:
+            - tag: component
+              value: cameras
+        - uuid: d278e972a6084c0eac54348190e38cf6
+          name: 'Avigilon: Cameras disabled'
+          type: DEPENDENT
+          key: avigilon.camera.count.disabled
+          trends: '365d'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.camera_count.disabled
+          master_item:
+            key: avigilon.unity.get
+          tags:
+            - tag: component
+              value: cameras
+        - uuid: 0568fd766c8e47e2b4897f7143635cfe
+          name: 'Avigilon: Windows service state (optional)'
+          status: DISABLED
+          key: 'service.info[{$AVIGILON.SERVICE.NAME},state]'
+          delay: 1m
+          trends: '365d'
+          description: 'Enable only when Zabbix Agent/Agent 2 is installed on the Windows recorder and the service-name macro has been verified.'
+          tags:
+            - tag: component
+              value: service
+          triggers:
+            - uuid: fc730f51d649470885ffc899e9e13ceb
+              expression: 'last(/Avigilon Unity Video by HTTP/service.info[{$AVIGILON.SERVICE.NAME},state])<>0'
+              name: 'Avigilon: Windows service is not running'
+              priority: HIGH
+              dependencies:
+                - name: 'Avigilon: Unity server or Web Endpoint is unavailable'
+                  expression: 'max(/Avigilon Unity Video by HTTP/avigilon.server.available,{$AVIGILON.FAIL.TIME})=0 or nodata(/Avigilon Unity Video by HTTP/avigilon.unity.get,{$AVIGILON.NODATA.TIME})=1'
+              tags:
+                - tag: scope
+                  value: service
+      discovery_rules:
+        - uuid: 903d8921759e4711b8405d7de3934be4
+          name: 'Avigilon: Discover cameras'
+          type: DEPENDENT
+          key: avigilon.camera.discovery
+          lifetime: 30d
+          item_prototypes:
+            - uuid: e432ae5b3ead41d190eb37c5e3088044
+              name: 'Avigilon: Camera {#CAMERA.NAME}: Connection state'
+              type: DEPENDENT
+              key: 'avigilon.camera.online[{#CAMERA.ID}]'
+              trends: '365d'
+              description: '0=disconnected, 1=online, 2=disabled, 3=state not recognized by the collector.'
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - '$.cameras[?(@.id == "{#CAMERA.ID}")].online.first()'
+              master_item:
+                key: avigilon.unity.get
+              tags:
+                - tag: camera
+                  value: '{#CAMERA.NAME}'
+                - tag: component
+                  value: camera
+              trigger_prototypes:
+                - uuid: 38998136a8ec4dbab403936bbff637f2
+                  expression: 'max(/Avigilon Unity Video by HTTP/avigilon.camera.online[{#CAMERA.ID}],{$AVIGILON.CAMERA.OFFLINE.TIME})=0 and min(/Avigilon Unity Video by HTTP/avigilon.camera.online[{#CAMERA.ID}],{$AVIGILON.CAMERA.OFFLINE.TIME})=0'
+                  name: 'Avigilon: Camera {#CAMERA.NAME} is disconnected'
+                  event_name: 'Avigilon camera {#CAMERA.NAME} is disconnected'
+                  priority: HIGH
+                  description: 'Unity reports this camera offline for the configured grace period.'
+                  dependencies:
+                    - name: 'Avigilon: API authentication or camera collection failed'
+                      expression: 'max(/Avigilon Unity Video by HTTP/avigilon.api.ok,{$AVIGILON.FAIL.TIME})=0'
+                    - name: 'Avigilon: Unity server or Web Endpoint is unavailable'
+                      expression: 'max(/Avigilon Unity Video by HTTP/avigilon.server.available,{$AVIGILON.FAIL.TIME})=0 or nodata(/Avigilon Unity Video by HTTP/avigilon.unity.get,{$AVIGILON.NODATA.TIME})=1'
+                    - name: 'Avigilon: No Unity site is reachable'
+                      expression: 'max(/Avigilon Unity Video by HTTP/avigilon.site.reachable,{$AVIGILON.FAIL.TIME})=0'
+                  tags:
+                    - tag: camera
+                      value: '{#CAMERA.NAME}'
+                    - tag: scope
+                      value: availability
+          master_item:
+            key: avigilon.unity.get
+          lld_macro_paths:
+            - lld_macro: '{#CAMERA.ID}'
+              path: $.id
+            - lld_macro: '{#CAMERA.NAME}'
+              path: $.name
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.cameras
+      macros:
+        - macro: '{$AVIGILON.API.PORT}'
+          value: '38880'
+          description: 'Unity API Gateway HTTPS port.'
+        - macro: '{$AVIGILON.CAMERA.OFFLINE.TIME}'
+          value: 2m
+          description: 'A camera must remain offline for this long before alerting.'
+        - macro: '{$AVIGILON.CLIENT.ID}'
+          value: CHANGE_ME
+          description: 'Client ID created in Unity Integration Management. Override on each host.'
+        - macro: '{$AVIGILON.CLIENT.SECRET}'
+          type: SECRET_TEXT
+          value: CHANGE_ME
+          description: 'Client secret created in Unity Integration Management. Override on each host.'
+        - macro: '{$AVIGILON.FAIL.TIME}'
+          value: 2m
+          description: 'Failure persistence required before raising availability problems.'
+        - macro: '{$AVIGILON.NODATA.TIME}'
+          value: 3m
+          description: 'Maximum time without a master item result.'
+        - macro: '{$AVIGILON.SERVICE.NAME}'
+          value: 'Avigilon Control Center Server'
+          description: 'Exact Windows service name or display name; verify before enabling the optional service item.'
+        - macro: '{$AVIGILON.TIMEOUT}'
+          value: 30s
+          description: 'Timeout for the collection script.'
+        - macro: '{$AVIGILON.UPDATE.INTERVAL}'
+          value: 1m
+          description: 'Health and camera polling interval.'
+        - macro: '{$AVIGILON.WEB.PORT}'
+          value: '8443'
+          description: 'Unity Web Endpoint HTTPS port used for the public service health/version check.'
+      tags:
+        - tag: class
+          value: video-surveillance
