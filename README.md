@@ -13,6 +13,13 @@ The template uses Unity 8 Integration Management client credentials. It does not
 - Total, online, disconnected, disabled, and unknown video-source counts
 - Low-level discovery of video sources
 - Individual camera-disconnection triggers with a configurable grace period
+- Camera status and diagnostic-error monitoring
+- Physical camera and encoder counts, inventory, and low-level discovery
+- Per-device connection, firmware, IP address, and health monitoring
+- Device health flags for error status, lost network, and prolonged errors
+- Expected camera/device count checks to detect removed resources
+- Server software display and full build versions
+- Paginated API collection for larger deployments
 - Trigger dependencies that suppress per-camera alerts during server, API, or site outages
 - Optional Windows service monitoring through Zabbix Agent or Agent 2
 
@@ -25,6 +32,10 @@ Unity's `Disabled` state is counted separately and does not generate a disconnec
 - Validated against Unity Video 8.8.0.22 and Web Endpoint build 36.0.2
 
 Newer Zabbix 7.x releases should accept the 7.0 export format. Zabbix 6.x may require conversion or manual recreation.
+
+## Upgrading from version 1
+
+Import the new YAML over the existing template and select the normal update-existing option. The template, original items, discovery rule, and trigger UUIDs are preserved, so existing hosts remain linked and retain their history. Version 2 adds new items and a second discovery rule.
 
 ## Installation
 
@@ -55,18 +66,42 @@ It requests scope `tq:api` and reads the Unity API Gateway resources under `/tq/
 | `{$AVIGILON.CLIENT.SECRET}` | `CHANGE_ME` | Client secret; stored as Zabbix secret text |
 | `{$AVIGILON.API.PORT}` | `38880` | Unity API Gateway HTTPS port |
 | `{$AVIGILON.WEB.PORT}` | `8443` | Unity Web Endpoint HTTPS port |
+| `{$AVIGILON.EXPECTED.CAMERA.COUNT}` | `0` | Minimum expected video-source count; zero disables the trigger |
+| `{$AVIGILON.EXPECTED.DEVICE.COUNT}` | `0` | Minimum expected physical-device count; zero disables the trigger |
+| `{$AVIGILON.CAMERA.OFFLINE.TIME}` | `2m` | Camera disconnection grace period |
+| `{$AVIGILON.DEVICE.OFFLINE.TIME}` | `2m` | Physical-device disconnection grace period |
+| `{$AVIGILON.HEALTH.INTERVAL}` | `10m` | Detailed physical-device health interval |
+| `{$AVIGILON.HEALTH.MAX.DEVICES}` | `50` | Devices checked per detailed-health poll; zero means all |
+| `{$AVIGILON.HEALTH.TIMEOUT}` | `60s` | Detailed-health collector timeout |
 
 Additional macros control polling, trigger delays, and the optional Windows service check.
 
 ## Alert-storm prevention
 
-Each discovered camera trigger depends on three root conditions:
+Each discovered camera and physical-device trigger depends on the applicable root conditions:
 
 1. Unity server/Web Endpoint availability
 2. API authentication and collection health
 3. Site reachability
 
 When one of those root conditions fails, Zabbix suppresses the dependent camera problems. This prevents a server outage from generating a separate notification for every camera.
+
+## Video sources versus physical devices
+
+Unity reports video data sources separately from physical cameras and encoders. A multi-sensor camera or encoder can provide several video sources, so the two totals are not expected to match.
+
+Version 2 discovers both layers:
+
+- Video-source items monitor the status and diagnostic result of every view/channel.
+- Physical-device items monitor the camera or encoder connection, firmware, IP address, and detailed device health.
+
+Depending on the fault, Unity may report both a physical device and its video sources offline. If that produces more detail than your notification policy needs, route the `component: device` and `component: camera` event tags differently in Zabbix actions.
+
+## Detailed health polling
+
+Unity exposes device health through one resource per physical device. The lower-frequency health collector therefore performs one health request for each checked device. It is separate from the one-minute availability poll and checks at most 50 devices by default.
+
+If the site contains more than the configured limit, the template records the skipped count and opens an informational capacity event. Increase the limit carefully, reduce the health polling frequency, or leave the remaining devices unchecked. A value of zero removes the limit but can exceed Zabbix's script timeout on large sites.
 
 ## Network and TLS requirements
 
@@ -83,7 +118,10 @@ After linking the template, confirm in **Latest data** that:
 - API collection successful is `1`.
 - Site reachable is `1`.
 - Camera totals match Unity Video.
+- Physical-device totals match Unity Video.
 - Cameras with unknown state is `0`.
+- Device health collection successful is `1`.
+- Devices skipped by detailed-health limit is `0`, unless intentionally limited.
 
 Perform a controlled camera disconnect and confirm that only its camera trigger opens after the configured grace period. Also test a server/API outage to verify that the dependency chain suppresses the individual camera notifications.
 
