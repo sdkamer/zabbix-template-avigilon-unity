@@ -1,0 +1,23 @@
+name: Validate template
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  yaml:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Parse Zabbix YAML
+        run: |
+          ruby -e 'require "yaml"; YAML.safe_load(File.read("zabbix_avigilon_unity_video_7.0.yaml"), aliases: true); puts "YAML is valid"'
+      - name: Reject common credential artifacts
+        run: |
+          if grep -RniE --exclude-dir=.git '(Authorization:[[:space:]]*Bearer[[:space:]]+eyJ|client_secret[[:space:]]*[:=][[:space:]]*[A-Za-z0-9+/=]{24,})' .; then
+            echo "Potential credential material detected"
+            exit 1
+          fi
