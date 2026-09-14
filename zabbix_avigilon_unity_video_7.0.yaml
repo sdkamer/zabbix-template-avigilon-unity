@@ -14,9 +14,10 @@ zabbix_export:
         uses an Integration Management client ID and secret with the OAuth 2.0 client
         credentials flow. No Unity username or password is required.
 
-        Override credential macros on each host. The camera and site triggers depend on
-        the server/API availability triggers so a recorder outage does not generate one
-        notification for every camera.
+        Version 2 adds physical-device discovery, diagnostic and device-health checks,
+        expected-count monitoring, pagination, and server software inventory. Override
+        credential macros on each host. Camera and device triggers depend on root
+        server/API/site triggers to prevent alert storms during recorder outages.
       groups:
         - name: Templates/Video surveillance
       items:
@@ -31,11 +32,20 @@ zabbix_export:
           params: |
             var p = JSON.parse(value);
             var out = {
-                server: {available: 0, health_good: 0, health: 'UNKNOWN'},
+                server: {
+                    available: 0,
+                    health_good: 0,
+                    health: 'UNKNOWN',
+                    software_display_version: '',
+                    software_version: ''
+                },
                 api: {ok: 0},
                 site: {reachable: 0, count: 0},
+                server_count: {total: 0, available: 0, unavailable: 0},
                 camera_count: {total: 0, connected: 0, disconnected: 0, disabled: 0, unknown: 0},
+                device_count: {total: 0, connected: 0, disconnected: 0, unknown: 0},
                 cameras: [],
+                devices: [],
                 error: ''
             };
 
@@ -73,6 +83,35 @@ zabbix_export:
                 return decoded;
             }
 
+            function requestCollection(req, url, label) {
+                var all = [], offset = 0, limit = 200, pageCount = 0;
+                var separator = url.indexOf('?') === -1 ? '?' : '&';
+
+                while (true) {
+                    var page = requestJson(
+                        req,
+                        'GET',
+                        url + separator + 'limit=' + limit + '&offset=' + offset,
+                        null,
+                        label
+                    );
+                    var collection = page.Collection || [];
+                    for (var i = 0; i < collection.length; i++) {
+                        all.push(collection[i]);
+                    }
+
+                    pageCount++;
+                    if (!page.Header || page.Header.HasMore !== true) {
+                        break;
+                    }
+                    if (collection.length === 0 || pageCount >= 50) {
+                        throw label + ' pagination did not complete';
+                    }
+                    offset += collection.length;
+                }
+                return all;
+            }
+
             function cameraState(status) {
                 var state = String(status || 'Unknown').toUpperCase();
                 if (state === 'ONLINE' || state === 'CONNECTED') {
@@ -86,6 +125,18 @@ zabbix_export:
                 }
                 // Unknown states do not create false disconnect alarms.
                 return 3;
+            }
+
+            function deviceState(device) {
+                var connection = String(device.ConnectionStatus || '').toUpperCase();
+                var state = String(device.State || '').toUpperCase();
+                if (connection === 'CONNECTED' && state === 'ONLINE') {
+                    return 1;
+                }
+                if (connection === 'DISCONNECTED' || state === 'OFFLINE') {
+                    return 0;
+                }
+                return 2;
             }
 
             var webBase = cleanUrl(p.web_base_url);
@@ -141,42 +192,55 @@ zabbix_export:
                 apiReq.addHeader('Accept: application/json');
                 apiReq.addHeader('Authorization: Bearer ' + tokenResponse.access_token);
 
-                var serversResponse = requestJson(
+                var servers = requestCollection(
                     apiReq,
-                    'GET',
                     apiBase + '/tq/v2/Servers',
-                    null,
                     'Servers endpoint'
                 );
-                var servers = serversResponse.Collection || [];
+                out.server_count.total = servers.length;
                 for (var s = 0; s < servers.length; s++) {
                     if (String(servers[s].State).toUpperCase() === 'AVAILABLE') {
-                        out.site.reachable = 1;
-                        break;
+                        out.server_count.available++;
+                    }
+                    else {
+                        out.server_count.unavailable++;
+                    }
+
+                    try {
+                        var software = requestJson(
+                            apiReq,
+                            'GET',
+                            apiBase + '/tq/v2/Servers/' + encodeURIComponent(servers[s].Id) +
+                                '/InstalledSoftwarePackage',
+                            null,
+                            'Installed software endpoint'
+                        );
+                        if (!out.server.software_display_version) {
+                            out.server.software_display_version = String(software.DisplayVersion || '');
+                            out.server.software_version = String(software.Version || '');
+                        }
+                    }
+                    catch (softwareError) {
+                        // Older Unity releases may not expose software inventory.
                     }
                 }
+                out.site.reachable = out.server_count.available > 0 ? 1 : 0;
 
-                var sitesResponse = requestJson(
+                var sites = requestCollection(
                     apiReq,
-                    'GET',
                     apiBase + '/tq/v2/Sites',
-                    null,
                     'Sites endpoint'
                 );
-                var sites = sitesResponse.Collection || [];
                 out.site.count = sites.length;
                 if (sites.length === 0) {
                     out.site.reachable = 0;
                 }
 
-                var cameraResponse = requestJson(
+                var cameras = requestCollection(
                     apiReq,
-                    'GET',
                     apiBase + '/tq/v2/DataSources',
-                    null,
                     'DataSources endpoint'
                 );
-                var cameras = cameraResponse.Collection || [];
 
                 for (var i = 0; i < cameras.length; i++) {
                     if (String(cameras[i].Type).toUpperCase() !== 'VIDEO' || !cameras[i].Id) {
@@ -184,11 +248,14 @@ zabbix_export:
                     }
 
                     var state = cameraState(cameras[i].Status);
+                    var diagnosticError = String(cameras[i].Error || 'Unknown');
                     out.cameras.push({
                         id: String(cameras[i].Id),
                         name: String(cameras[i].Name || cameras[i].Id),
                         state: String(cameras[i].Status || 'Unknown'),
-                        online: state
+                        online: state,
+                        diagnostic_error: diagnosticError,
+                        diagnostic_ok: diagnosticError.toUpperCase() === 'NOERROR' ? 1 : 0
                     });
 
                     if (state === 1) {
@@ -206,6 +273,43 @@ zabbix_export:
                 }
 
                 out.camera_count.total = out.cameras.length;
+
+                var devices = requestCollection(
+                    apiReq,
+                    apiBase + '/tq/v2/Devices',
+                    'Devices endpoint'
+                );
+                for (var d = 0; d < devices.length; d++) {
+                    if (!devices[d].Id) {
+                        continue;
+                    }
+
+                    var online = deviceState(devices[d]);
+                    out.devices.push({
+                        id: String(devices[d].Id),
+                        name: String(devices[d].Name || devices[d].Id),
+                        type: String(devices[d].Type || 'Unknown'),
+                        vendor: String(devices[d].Vendor || 'Unknown'),
+                        model: String(devices[d].Model || 'Unknown'),
+                        driver: String(devices[d].DriverType || 'Unknown'),
+                        version: String(devices[d].Version || 'Unknown'),
+                        ip: String(devices[d].IpAddressInUse || ''),
+                        state: String(devices[d].State || 'Unknown'),
+                        connection_status: String(devices[d].ConnectionStatus || 'Unknown'),
+                        online: online
+                    });
+
+                    if (online === 1) {
+                        out.device_count.connected++;
+                    }
+                    else if (online === 0) {
+                        out.device_count.disconnected++;
+                    }
+                    else {
+                        out.device_count.unknown++;
+                    }
+                }
+                out.device_count.total = out.devices.length;
                 out.api.ok = 1;
             }
             catch (e) {
@@ -223,7 +327,182 @@ zabbix_export:
             - name: web_base_url
               value: 'https://{HOST.CONN}:{$AVIGILON.WEB.PORT}'
           timeout: '{$AVIGILON.TIMEOUT}'
-          description: 'Collects health, site, and camera information in one request cycle.'
+          description: 'Collects service, site, server, software, camera, and physical-device information. Collection endpoints are paginated.'
+          tags:
+            - tag: component
+              value: raw
+        - uuid: 4e72114711594b45b8f53093b9d4b47e
+          name: 'Avigilon: Collect physical-device health'
+          type: SCRIPT
+          key: avigilon.device.health.get
+          delay: '{$AVIGILON.HEALTH.INTERVAL}'
+          history: '1d'
+          trends: '0'
+          value_type: TEXT
+          params: |
+            var p = JSON.parse(value);
+            var out = {
+                api: {ok: 0},
+                device_count: {total: 0, checked: 0, skipped: 0, errors: 0},
+                health: [],
+                error: ''
+            };
+
+            function cleanUrl(url) {
+                return String(url).replace(/\/+$/, '');
+            }
+
+            function parseJson(body, label) {
+                try {
+                    return JSON.parse(body);
+                }
+                catch (e) {
+                    throw label + ' returned invalid JSON';
+                }
+            }
+
+            function requestJson(req, method, url, body, label) {
+                var response = method === 'POST' ? req.post(url, body) : req.get(url);
+                var status = req.getStatus();
+                if (status < 200 || status >= 300) {
+                    throw label + ' returned HTTP ' + status;
+                }
+                return parseJson(response, label);
+            }
+
+            function requestCollection(req, url, label) {
+                var all = [], offset = 0, limit = 200, pageCount = 0;
+                var separator = url.indexOf('?') === -1 ? '?' : '&';
+
+                while (true) {
+                    var page = requestJson(
+                        req,
+                        'GET',
+                        url + separator + 'limit=' + limit + '&offset=' + offset,
+                        null,
+                        label
+                    );
+                    var collection = page.Collection || [];
+                    for (var i = 0; i < collection.length; i++) {
+                        all.push(collection[i]);
+                    }
+                    pageCount++;
+                    if (!page.Header || page.Header.HasMore !== true) {
+                        break;
+                    }
+                    if (collection.length === 0 || pageCount >= 50) {
+                        throw label + ' pagination did not complete';
+                    }
+                    offset += collection.length;
+                }
+                return all;
+            }
+
+            var apiBase = cleanUrl(p.api_base_url);
+
+            try {
+                if (!p.client_id || !p.client_secret ||
+                        p.client_id === 'CHANGE_ME' || p.client_secret === 'CHANGE_ME') {
+                    throw 'Set the Avigilon client ID and client secret macros on this host';
+                }
+
+                var tokenReq = new HttpRequest();
+                tokenReq.addHeader('Accept: application/json');
+                tokenReq.addHeader('Content-Type: application/x-www-form-urlencoded');
+                var tokenResponse = requestJson(
+                    tokenReq,
+                    'POST',
+                    apiBase + '/connect/token',
+                    'grant_type=client_credentials&scope=tq%3Aapi&client_id=' +
+                        encodeURIComponent(p.client_id) + '&client_secret=' +
+                        encodeURIComponent(p.client_secret),
+                    'OAuth token endpoint'
+                );
+                if (!tokenResponse.access_token) {
+                    throw 'OAuth token endpoint returned no access token';
+                }
+
+                var apiReq = new HttpRequest();
+                apiReq.addHeader('Accept: application/json');
+                apiReq.addHeader('Authorization: Bearer ' + tokenResponse.access_token);
+                var devices = requestCollection(
+                    apiReq,
+                    apiBase + '/tq/v2/Devices',
+                    'Devices endpoint'
+                );
+
+                var configuredLimit = parseInt(p.health_limit, 10);
+                if (isNaN(configuredLimit) || configuredLimit < 0) {
+                    configuredLimit = 50;
+                }
+                var checkLimit = configuredLimit === 0 ? devices.length :
+                    Math.min(configuredLimit, devices.length);
+                out.device_count.total = devices.length;
+
+                for (var i = 0; i < devices.length; i++) {
+                    var result = {
+                        id: String(devices[i].Id),
+                        name: String(devices[i].Name || devices[i].Id),
+                        checked: i < checkLimit ? 1 : 0,
+                        request_ok: 1,
+                        health_ok: 2,
+                        error_status: 'NotChecked',
+                        lost_network: 0,
+                        prolonged_error: 0
+                    };
+
+                    if (i >= checkLimit) {
+                        out.device_count.skipped++;
+                        out.health.push(result);
+                        continue;
+                    }
+
+                    out.device_count.checked++;
+                    try {
+                        var health = requestJson(
+                            apiReq,
+                            'GET',
+                            apiBase + '/tq/v2/Devices/' + encodeURIComponent(devices[i].Id) +
+                                '/Health',
+                            null,
+                            'Device health endpoint'
+                        );
+                        result.error_status = String(health.ErrorStatus || 'Unknown');
+                        result.lost_network = health.HasLostNetworkConnection === true ? 1 : 0;
+                        result.prolonged_error = health.HasProlongedError === true ? 1 : 0;
+                        result.health_ok = result.error_status.toUpperCase() === 'NOERROR' &&
+                            result.lost_network === 0 && result.prolonged_error === 0 ? 1 : 0;
+                    }
+                    catch (deviceError) {
+                        result.request_ok = 0;
+                        result.health_ok = 0;
+                        result.error_status = 'RequestError';
+                        out.device_count.errors++;
+                    }
+                    out.health.push(result);
+                }
+
+                out.api.ok = out.device_count.errors === 0 ? 1 : 0;
+                if (out.device_count.errors > 0) {
+                    out.error = out.device_count.errors + ' device health request(s) failed';
+                }
+            }
+            catch (e) {
+                out.error = String(e);
+            }
+
+            return JSON.stringify(out);
+          parameters:
+            - name: api_base_url
+              value: 'https://{HOST.CONN}:{$AVIGILON.API.PORT}'
+            - name: client_id
+              value: '{$AVIGILON.CLIENT.ID}'
+            - name: client_secret
+              value: '{$AVIGILON.CLIENT.SECRET}'
+            - name: health_limit
+              value: '{$AVIGILON.HEALTH.MAX.DEVICES}'
+          timeout: '{$AVIGILON.HEALTH.TIMEOUT}'
+          description: 'Collects detailed health for physical devices at a lower frequency. A limit prevents large sites from exceeding the script timeout; zero checks all devices.'
           tags:
             - tag: component
               value: raw
@@ -392,6 +671,17 @@ zabbix_export:
           tags:
             - tag: component
               value: cameras
+          triggers:
+            - uuid: 6bf108815bdb46ad9d84cf88fe06ac33
+              expression: '{$AVIGILON.EXPECTED.CAMERA.COUNT}>0 and max(/Avigilon Unity Video by HTTP/avigilon.camera.count.total,{$AVIGILON.FAIL.TIME})<{$AVIGILON.EXPECTED.CAMERA.COUNT}'
+              name: 'Avigilon: Camera count is below the expected minimum'
+              priority: HIGH
+              description: 'The number of video data sources is below the configured expected count. Set the macro to zero to disable this check.'
+              dependencies:
+                - name: 'Avigilon: API authentication or camera collection failed'
+                  expression: 'max(/Avigilon Unity Video by HTTP/avigilon.api.ok,{$AVIGILON.FAIL.TIME})=0'
+                - name: 'Avigilon: Unity server or Web Endpoint is unavailable'
+                  expression: 'max(/Avigilon Unity Video by HTTP/avigilon.server.available,{$AVIGILON.FAIL.TIME})=0 or nodata(/Avigilon Unity Video by HTTP/avigilon.unity.get,{$AVIGILON.NODATA.TIME})=1'
         - uuid: 509842fc4faf4fa994651f582b165677
           name: 'Avigilon: Cameras connected'
           type: DEPENDENT
@@ -448,6 +738,284 @@ zabbix_export:
           tags:
             - tag: component
               value: cameras
+        - uuid: c9a0bbefe2134a76934a117a39d951e7
+          name: 'Avigilon: Device health collection successful'
+          type: DEPENDENT
+          key: avigilon.device.health.api.ok
+          trends: '365d'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.api.ok
+          master_item:
+            key: avigilon.device.health.get
+          tags:
+            - tag: component
+              value: availability
+          triggers:
+            - uuid: 179acf72ebda4f6080b81ada1c64c741
+              expression: 'count(/Avigilon Unity Video by HTTP/avigilon.device.health.api.ok,#2)=2 and max(/Avigilon Unity Video by HTTP/avigilon.device.health.api.ok,#2)=0 or nodata(/Avigilon Unity Video by HTTP/avigilon.device.health.get,{$AVIGILON.HEALTH.NODATA.TIME})=1'
+              name: 'Avigilon: Physical-device health collection failed'
+              priority: WARNING
+              description: 'Two consecutive detailed health collections failed, or the health collector stopped returning data.'
+              dependencies:
+                - name: 'Avigilon: API authentication or camera collection failed'
+                  expression: 'max(/Avigilon Unity Video by HTTP/avigilon.api.ok,{$AVIGILON.FAIL.TIME})=0'
+                - name: 'Avigilon: Unity server or Web Endpoint is unavailable'
+                  expression: 'max(/Avigilon Unity Video by HTTP/avigilon.server.available,{$AVIGILON.FAIL.TIME})=0 or nodata(/Avigilon Unity Video by HTTP/avigilon.unity.get,{$AVIGILON.NODATA.TIME})=1'
+              tags:
+                - tag: scope
+                  value: availability
+        - uuid: bddcdef1b9e447af8141d8ba2a88ee26
+          name: 'Avigilon: Device health collection error'
+          type: DEPENDENT
+          key: avigilon.device.health.error
+          history: '7d'
+          trends: '0'
+          value_type: TEXT
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.error
+          master_item:
+            key: avigilon.device.health.get
+          tags:
+            - tag: component
+              value: error
+        - uuid: c0ca5cdc356e42f88916138522276157
+          name: 'Avigilon: Devices checked for detailed health'
+          type: DEPENDENT
+          key: avigilon.device.health.count.checked
+          trends: '365d'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.device_count.checked
+          master_item:
+            key: avigilon.device.health.get
+          tags:
+            - tag: component
+              value: health
+        - uuid: aa698839a23641828e61a464921b9f48
+          name: 'Avigilon: Devices skipped by detailed-health limit'
+          type: DEPENDENT
+          key: avigilon.device.health.count.skipped
+          trends: '365d'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.device_count.skipped
+          master_item:
+            key: avigilon.device.health.get
+          tags:
+            - tag: component
+              value: health
+          triggers:
+            - uuid: d29a81160e2946cfabd31daa0962f19f
+              expression: 'last(/Avigilon Unity Video by HTTP/avigilon.device.health.count.skipped)>0'
+              name: 'Avigilon: Some physical devices are excluded from detailed health checks'
+              priority: INFO
+              description: 'Raise the health maximum-devices macro carefully, reduce polling frequency, or leave this as an informational capacity warning.'
+              dependencies:
+                - name: 'Avigilon: Physical-device health collection failed'
+                  expression: 'count(/Avigilon Unity Video by HTTP/avigilon.device.health.api.ok,#2)=2 and max(/Avigilon Unity Video by HTTP/avigilon.device.health.api.ok,#2)=0 or nodata(/Avigilon Unity Video by HTTP/avigilon.device.health.get,{$AVIGILON.HEALTH.NODATA.TIME})=1'
+              tags:
+                - tag: scope
+                  value: capacity
+        - uuid: ed61a11e5bbc4f4ea03642ef800d0374
+          name: 'Avigilon: Device health request errors'
+          type: DEPENDENT
+          key: avigilon.device.health.count.errors
+          trends: '365d'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.device_count.errors
+          master_item:
+            key: avigilon.device.health.get
+          tags:
+            - tag: component
+              value: health
+        - uuid: 2b770bda256044ed965fcae1a6ef17c7
+          name: 'Avigilon: Sites total'
+          type: DEPENDENT
+          key: avigilon.site.count.total
+          trends: '365d'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.site.count
+          master_item:
+            key: avigilon.unity.get
+          tags:
+            - tag: component
+              value: site
+        - uuid: 9af368f2d6da4d45a2444012f20c768c
+          name: 'Avigilon: Servers total'
+          type: DEPENDENT
+          key: avigilon.server.count.total
+          trends: '365d'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.server_count.total
+          master_item:
+            key: avigilon.unity.get
+          tags:
+            - tag: component
+              value: server
+        - uuid: 6adf6786883e40edb7d2d6dd020a209a
+          name: 'Avigilon: Servers available'
+          type: DEPENDENT
+          key: avigilon.server.count.available
+          trends: '365d'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.server_count.available
+          master_item:
+            key: avigilon.unity.get
+          tags:
+            - tag: component
+              value: server
+        - uuid: 01f658aa1f7f40f79faa365e1ecaf758
+          name: 'Avigilon: Servers unavailable'
+          type: DEPENDENT
+          key: avigilon.server.count.unavailable
+          trends: '365d'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.server_count.unavailable
+          master_item:
+            key: avigilon.unity.get
+          tags:
+            - tag: component
+              value: server
+          triggers:
+            - uuid: 7ddbf0ff857244b48aa7dd6c2fcdb65b
+              expression: 'min(/Avigilon Unity Video by HTTP/avigilon.server.count.unavailable,{$AVIGILON.FAIL.TIME})>0'
+              name: 'Avigilon: One or more Unity servers are unavailable'
+              priority: HIGH
+              dependencies:
+                - name: 'Avigilon: API authentication or camera collection failed'
+                  expression: 'max(/Avigilon Unity Video by HTTP/avigilon.api.ok,{$AVIGILON.FAIL.TIME})=0'
+                - name: 'Avigilon: Unity server or Web Endpoint is unavailable'
+                  expression: 'max(/Avigilon Unity Video by HTTP/avigilon.server.available,{$AVIGILON.FAIL.TIME})=0 or nodata(/Avigilon Unity Video by HTTP/avigilon.unity.get,{$AVIGILON.NODATA.TIME})=1'
+              tags:
+                - tag: scope
+                  value: availability
+        - uuid: 94a0cd766e3f4699ae5462189aa955bc
+          name: 'Avigilon: Unity API software display version'
+          type: DEPENDENT
+          key: avigilon.api.software.version.display
+          history: '30d'
+          trends: '0'
+          value_type: CHAR
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.server.software_display_version
+          master_item:
+            key: avigilon.unity.get
+          tags:
+            - tag: component
+              value: inventory
+          triggers:
+            - uuid: a1789e65bcd7411985e8d8ce493cdf98
+              expression: 'last(/Avigilon Unity Video by HTTP/avigilon.api.software.version.display,#1)<>last(/Avigilon Unity Video by HTTP/avigilon.api.software.version.display,#2)'
+              name: 'Avigilon: Unity software version changed'
+              priority: INFO
+              description: 'Informational event recording a detected Unity software upgrade or downgrade.'
+              dependencies:
+                - name: 'Avigilon: API authentication or camera collection failed'
+                  expression: 'max(/Avigilon Unity Video by HTTP/avigilon.api.ok,{$AVIGILON.FAIL.TIME})=0'
+              tags:
+                - tag: scope
+                  value: change
+        - uuid: 09a05812c05649e6945c7e87b53b187a
+          name: 'Avigilon: Unity API full build version'
+          type: DEPENDENT
+          key: avigilon.api.software.version.full
+          history: '30d'
+          trends: '0'
+          value_type: CHAR
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.server.software_version
+          master_item:
+            key: avigilon.unity.get
+          tags:
+            - tag: component
+              value: inventory
+        - uuid: 5609565d6f1a4ce6ae541a4d074f6adb
+          name: 'Avigilon: Physical devices total'
+          type: DEPENDENT
+          key: avigilon.device.count.total
+          trends: '365d'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.device_count.total
+          master_item:
+            key: avigilon.unity.get
+          tags:
+            - tag: component
+              value: device
+          triggers:
+            - uuid: 7546285749c448e5a8218ab7c7ca73b0
+              expression: '{$AVIGILON.EXPECTED.DEVICE.COUNT}>0 and max(/Avigilon Unity Video by HTTP/avigilon.device.count.total,{$AVIGILON.FAIL.TIME})<{$AVIGILON.EXPECTED.DEVICE.COUNT}'
+              name: 'Avigilon: Physical-device count is below the expected minimum'
+              priority: HIGH
+              description: 'The number of physical cameras and encoders is below the configured expected count. Set the macro to zero to disable this check.'
+              dependencies:
+                - name: 'Avigilon: API authentication or camera collection failed'
+                  expression: 'max(/Avigilon Unity Video by HTTP/avigilon.api.ok,{$AVIGILON.FAIL.TIME})=0'
+                - name: 'Avigilon: Unity server or Web Endpoint is unavailable'
+                  expression: 'max(/Avigilon Unity Video by HTTP/avigilon.server.available,{$AVIGILON.FAIL.TIME})=0 or nodata(/Avigilon Unity Video by HTTP/avigilon.unity.get,{$AVIGILON.NODATA.TIME})=1'
+        - uuid: 0796b2bb1b2a448a8df22f2603ce291a
+          name: 'Avigilon: Physical devices connected'
+          type: DEPENDENT
+          key: avigilon.device.count.connected
+          trends: '365d'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.device_count.connected
+          master_item:
+            key: avigilon.unity.get
+          tags:
+            - tag: component
+              value: device
+        - uuid: f2cbda625b3a4e1ebb0800cba60677af
+          name: 'Avigilon: Physical devices disconnected'
+          type: DEPENDENT
+          key: avigilon.device.count.disconnected
+          trends: '365d'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.device_count.disconnected
+          master_item:
+            key: avigilon.unity.get
+          tags:
+            - tag: component
+              value: device
+        - uuid: a8f8dec482cd432aab0e58b940136cac
+          name: 'Avigilon: Physical devices with unknown state'
+          type: DEPENDENT
+          key: avigilon.device.count.unknown
+          trends: '365d'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.device_count.unknown
+          master_item:
+            key: avigilon.unity.get
+          tags:
+            - tag: component
+              value: device
         - uuid: 0568fd766c8e47e2b4897f7143635cfe
           name: 'Avigilon: Windows service state (optional)'
           status: DISABLED
@@ -512,6 +1080,75 @@ zabbix_export:
                       value: '{#CAMERA.NAME}'
                     - tag: scope
                       value: availability
+            - uuid: 1544b1db400041e691bc0f4f0d5711d8
+              name: 'Avigilon: Camera {#CAMERA.NAME}: Unity status'
+              type: DEPENDENT
+              key: 'avigilon.camera.status[{#CAMERA.ID}]'
+              history: '30d'
+              trends: '0'
+              value_type: CHAR
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - '$.cameras[?(@.id == "{#CAMERA.ID}")].state.first()'
+              master_item:
+                key: avigilon.unity.get
+              tags:
+                - tag: camera
+                  value: '{#CAMERA.NAME}'
+                - tag: component
+                  value: camera
+            - uuid: 7a5e95a84a5b43b1a64e92ef72d14a03
+              name: 'Avigilon: Camera {#CAMERA.NAME}: Diagnostic status is good'
+              type: DEPENDENT
+              key: 'avigilon.camera.diagnostic.ok[{#CAMERA.ID}]'
+              trends: '365d'
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - '$.cameras[?(@.id == "{#CAMERA.ID}")].diagnostic_ok.first()'
+              master_item:
+                key: avigilon.unity.get
+              tags:
+                - tag: camera
+                  value: '{#CAMERA.NAME}'
+                - tag: component
+                  value: health
+              trigger_prototypes:
+                - uuid: 0315575dd635482895b14b69e174999b
+                  expression: 'max(/Avigilon Unity Video by HTTP/avigilon.camera.diagnostic.ok[{#CAMERA.ID}],{$AVIGILON.FAIL.TIME})=0 and min(/Avigilon Unity Video by HTTP/avigilon.camera.diagnostic.ok[{#CAMERA.ID}],{$AVIGILON.FAIL.TIME})=0'
+                  name: 'Avigilon: Camera {#CAMERA.NAME} reports a diagnostic error'
+                  priority: AVERAGE
+                  dependencies:
+                    - name: 'Avigilon: API authentication or camera collection failed'
+                      expression: 'max(/Avigilon Unity Video by HTTP/avigilon.api.ok,{$AVIGILON.FAIL.TIME})=0'
+                    - name: 'Avigilon: Unity server or Web Endpoint is unavailable'
+                      expression: 'max(/Avigilon Unity Video by HTTP/avigilon.server.available,{$AVIGILON.FAIL.TIME})=0 or nodata(/Avigilon Unity Video by HTTP/avigilon.unity.get,{$AVIGILON.NODATA.TIME})=1'
+                    - name: 'Avigilon: No Unity site is reachable'
+                      expression: 'max(/Avigilon Unity Video by HTTP/avigilon.site.reachable,{$AVIGILON.FAIL.TIME})=0'
+                  tags:
+                    - tag: camera
+                      value: '{#CAMERA.NAME}'
+                    - tag: scope
+                      value: health
+            - uuid: 30d209b1028745ed9d038be4fd8428dc
+              name: 'Avigilon: Camera {#CAMERA.NAME}: Diagnostic error'
+              type: DEPENDENT
+              key: 'avigilon.camera.diagnostic.error[{#CAMERA.ID}]'
+              history: '30d'
+              trends: '0'
+              value_type: CHAR
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - '$.cameras[?(@.id == "{#CAMERA.ID}")].diagnostic_error.first()'
+              master_item:
+                key: avigilon.unity.get
+              tags:
+                - tag: camera
+                  value: '{#CAMERA.NAME}'
+                - tag: component
+                  value: health
           master_item:
             key: avigilon.unity.get
           lld_macro_paths:
@@ -523,6 +1160,235 @@ zabbix_export:
             - type: JSONPATH
               parameters:
                 - $.cameras
+        - uuid: 81e4d031bb9b472f87988873a1fd4957
+          name: 'Avigilon: Discover physical devices'
+          type: DEPENDENT
+          key: avigilon.device.discovery
+          lifetime: 30d
+          item_prototypes:
+            - uuid: 428cba96e2fe41f192acd74ee9c1f253
+              name: 'Avigilon: Physical device {#DEVICE.NAME}: Connection state'
+              type: DEPENDENT
+              key: 'avigilon.device.online[{#DEVICE.ID}]'
+              trends: '365d'
+              description: '0=disconnected/offline, 1=connected/online, 2=state not recognized.'
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - '$.devices[?(@.id == "{#DEVICE.ID}")].online.first()'
+              master_item:
+                key: avigilon.unity.get
+              tags:
+                - tag: component
+                  value: device
+                - tag: device
+                  value: '{#DEVICE.NAME}'
+              trigger_prototypes:
+                - uuid: bd63dc4a638f4d1fb7e5f7868369731d
+                  expression: 'max(/Avigilon Unity Video by HTTP/avigilon.device.online[{#DEVICE.ID}],{$AVIGILON.DEVICE.OFFLINE.TIME})=0 and min(/Avigilon Unity Video by HTTP/avigilon.device.online[{#DEVICE.ID}],{$AVIGILON.DEVICE.OFFLINE.TIME})=0'
+                  name: 'Avigilon: Physical device {#DEVICE.NAME} is disconnected'
+                  priority: HIGH
+                  description: 'Unity reports the physical camera or encoder disconnected for the configured grace period.'
+                  dependencies:
+                    - name: 'Avigilon: API authentication or camera collection failed'
+                      expression: 'max(/Avigilon Unity Video by HTTP/avigilon.api.ok,{$AVIGILON.FAIL.TIME})=0'
+                    - name: 'Avigilon: Unity server or Web Endpoint is unavailable'
+                      expression: 'max(/Avigilon Unity Video by HTTP/avigilon.server.available,{$AVIGILON.FAIL.TIME})=0 or nodata(/Avigilon Unity Video by HTTP/avigilon.unity.get,{$AVIGILON.NODATA.TIME})=1'
+                    - name: 'Avigilon: No Unity site is reachable'
+                      expression: 'max(/Avigilon Unity Video by HTTP/avigilon.site.reachable,{$AVIGILON.FAIL.TIME})=0'
+                  tags:
+                    - tag: device
+                      value: '{#DEVICE.NAME}'
+                    - tag: scope
+                      value: availability
+            - uuid: ad5f7e138a6a464bb4257fae9a968cac
+              name: 'Avigilon: Physical device {#DEVICE.NAME}: Unity state'
+              type: DEPENDENT
+              key: 'avigilon.device.state[{#DEVICE.ID}]'
+              history: '30d'
+              trends: '0'
+              value_type: CHAR
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - '$.devices[?(@.id == "{#DEVICE.ID}")].state.first()'
+              master_item:
+                key: avigilon.unity.get
+              tags:
+                - tag: component
+                  value: device
+                - tag: device
+                  value: '{#DEVICE.NAME}'
+            - uuid: 979825ea3db3436c87703519fc5ae7f4
+              name: 'Avigilon: Physical device {#DEVICE.NAME}: Firmware version'
+              type: DEPENDENT
+              key: 'avigilon.device.version[{#DEVICE.ID}]'
+              history: '90d'
+              trends: '0'
+              value_type: CHAR
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - '$.devices[?(@.id == "{#DEVICE.ID}")].version.first()'
+              master_item:
+                key: avigilon.unity.get
+              tags:
+                - tag: component
+                  value: inventory
+                - tag: device
+                  value: '{#DEVICE.NAME}'
+              trigger_prototypes:
+                - uuid: c8f590badf9c484ead225b65fcd592c7
+                  expression: 'last(/Avigilon Unity Video by HTTP/avigilon.device.version[{#DEVICE.ID}],#1)<>last(/Avigilon Unity Video by HTTP/avigilon.device.version[{#DEVICE.ID}],#2)'
+                  name: 'Avigilon: Physical device {#DEVICE.NAME} firmware changed'
+                  priority: INFO
+                  description: 'Informational event recording a detected firmware change.'
+                  dependencies:
+                    - name: 'Avigilon: API authentication or camera collection failed'
+                      expression: 'max(/Avigilon Unity Video by HTTP/avigilon.api.ok,{$AVIGILON.FAIL.TIME})=0'
+                  tags:
+                    - tag: device
+                      value: '{#DEVICE.NAME}'
+                    - tag: scope
+                      value: change
+            - uuid: 169866a0e1a74f20b3665d6cc9abcae6
+              name: 'Avigilon: Physical device {#DEVICE.NAME}: IP address'
+              type: DEPENDENT
+              key: 'avigilon.device.ip[{#DEVICE.ID}]'
+              history: '90d'
+              trends: '0'
+              value_type: CHAR
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - '$.devices[?(@.id == "{#DEVICE.ID}")].ip.first()'
+              master_item:
+                key: avigilon.unity.get
+              tags:
+                - tag: component
+                  value: inventory
+                - tag: device
+                  value: '{#DEVICE.NAME}'
+            - uuid: 22d3de683e0443d28250383e25bb2ae0
+              name: 'Avigilon: Physical device {#DEVICE.NAME}: Detailed health is good'
+              type: DEPENDENT
+              key: 'avigilon.device.health.ok[{#DEVICE.ID}]'
+              trends: '365d'
+              description: '0=health problem, 1=healthy, 2=not checked because of the configured device limit.'
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - '$.health[?(@.id == "{#DEVICE.ID}")].health_ok.first()'
+              master_item:
+                key: avigilon.device.health.get
+              tags:
+                - tag: component
+                  value: health
+                - tag: device
+                  value: '{#DEVICE.NAME}'
+              trigger_prototypes:
+                - uuid: 8ab3060ae6b34f529442347afbbba6fb
+                  expression: 'max(/Avigilon Unity Video by HTTP/avigilon.device.health.ok[{#DEVICE.ID}],#2)=0 and min(/Avigilon Unity Video by HTTP/avigilon.device.health.ok[{#DEVICE.ID}],#2)=0'
+                  name: 'Avigilon: Physical device {#DEVICE.NAME} reports a health problem'
+                  priority: AVERAGE
+                  description: 'The device ErrorStatus is not NoError, it reports a lost network connection or prolonged error, or its health request failed.'
+                  dependencies:
+                    - name: 'Avigilon: Physical-device health collection failed'
+                      expression: 'count(/Avigilon Unity Video by HTTP/avigilon.device.health.api.ok,#2)=2 and max(/Avigilon Unity Video by HTTP/avigilon.device.health.api.ok,#2)=0 or nodata(/Avigilon Unity Video by HTTP/avigilon.device.health.get,{$AVIGILON.HEALTH.NODATA.TIME})=1'
+                    - name: 'Avigilon: API authentication or camera collection failed'
+                      expression: 'max(/Avigilon Unity Video by HTTP/avigilon.api.ok,{$AVIGILON.FAIL.TIME})=0'
+                    - name: 'Avigilon: Unity server or Web Endpoint is unavailable'
+                      expression: 'max(/Avigilon Unity Video by HTTP/avigilon.server.available,{$AVIGILON.FAIL.TIME})=0 or nodata(/Avigilon Unity Video by HTTP/avigilon.unity.get,{$AVIGILON.NODATA.TIME})=1'
+                  tags:
+                    - tag: device
+                      value: '{#DEVICE.NAME}'
+                    - tag: scope
+                      value: health
+            - uuid: 275375740ae84fd592d553d8844bfc18
+              name: 'Avigilon: Physical device {#DEVICE.NAME}: Health error status'
+              type: DEPENDENT
+              key: 'avigilon.device.health.error[{#DEVICE.ID}]'
+              history: '30d'
+              trends: '0'
+              value_type: CHAR
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - '$.health[?(@.id == "{#DEVICE.ID}")].error_status.first()'
+              master_item:
+                key: avigilon.device.health.get
+              tags:
+                - tag: component
+                  value: health
+                - tag: device
+                  value: '{#DEVICE.NAME}'
+            - uuid: 3ba23e4086f84698a6339277d2705c2d
+              name: 'Avigilon: Physical device {#DEVICE.NAME}: Health check performed'
+              type: DEPENDENT
+              key: 'avigilon.device.health.checked[{#DEVICE.ID}]'
+              trends: '365d'
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - '$.health[?(@.id == "{#DEVICE.ID}")].checked.first()'
+              master_item:
+                key: avigilon.device.health.get
+              tags:
+                - tag: component
+                  value: health
+                - tag: device
+                  value: '{#DEVICE.NAME}'
+            - uuid: 038314800c0b470a89574ac032e4d091
+              name: 'Avigilon: Physical device {#DEVICE.NAME}: Lost-network health flag'
+              type: DEPENDENT
+              key: 'avigilon.device.health.lost_network[{#DEVICE.ID}]'
+              trends: '365d'
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - '$.health[?(@.id == "{#DEVICE.ID}")].lost_network.first()'
+              master_item:
+                key: avigilon.device.health.get
+              tags:
+                - tag: component
+                  value: health
+                - tag: device
+                  value: '{#DEVICE.NAME}'
+            - uuid: 2cab772d9edf482f84b250ef5de6acaf
+              name: 'Avigilon: Physical device {#DEVICE.NAME}: Prolonged-error health flag'
+              type: DEPENDENT
+              key: 'avigilon.device.health.prolonged_error[{#DEVICE.ID}]'
+              trends: '365d'
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - '$.health[?(@.id == "{#DEVICE.ID}")].prolonged_error.first()'
+              master_item:
+                key: avigilon.device.health.get
+              tags:
+                - tag: component
+                  value: health
+                - tag: device
+                  value: '{#DEVICE.NAME}'
+          master_item:
+            key: avigilon.unity.get
+          lld_macro_paths:
+            - lld_macro: '{#DEVICE.DRIVER}'
+              path: $.driver
+            - lld_macro: '{#DEVICE.ID}'
+              path: $.id
+            - lld_macro: '{#DEVICE.MODEL}'
+              path: $.model
+            - lld_macro: '{#DEVICE.NAME}'
+              path: $.name
+            - lld_macro: '{#DEVICE.TYPE}'
+              path: $.type
+            - lld_macro: '{#DEVICE.VENDOR}'
+              path: $.vendor
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.devices
       macros:
         - macro: '{$AVIGILON.API.PORT}'
           value: '38880'
@@ -537,12 +1403,33 @@ zabbix_export:
           type: SECRET_TEXT
           value: CHANGE_ME
           description: 'Client secret created in Unity Integration Management. Override on each host.'
+        - macro: '{$AVIGILON.DEVICE.OFFLINE.TIME}'
+          value: 2m
+          description: 'A physical camera or encoder must remain offline for this long before alerting.'
+        - macro: '{$AVIGILON.EXPECTED.CAMERA.COUNT}'
+          value: '0'
+          description: 'Minimum expected video-source count. Zero disables the count trigger.'
+        - macro: '{$AVIGILON.EXPECTED.DEVICE.COUNT}'
+          value: '0'
+          description: 'Minimum expected physical camera/encoder count. Zero disables the count trigger.'
         - macro: '{$AVIGILON.FAIL.TIME}'
           value: 2m
           description: 'Failure persistence required before raising availability problems.'
         - macro: '{$AVIGILON.NODATA.TIME}'
           value: 3m
           description: 'Maximum time without a master item result.'
+        - macro: '{$AVIGILON.HEALTH.INTERVAL}'
+          value: 10m
+          description: 'Detailed physical-device health polling interval.'
+        - macro: '{$AVIGILON.HEALTH.MAX.DEVICES}'
+          value: '50'
+          description: 'Maximum physical devices checked per detailed-health poll. Zero checks all devices; raise cautiously.'
+        - macro: '{$AVIGILON.HEALTH.NODATA.TIME}'
+          value: 25m
+          description: 'Maximum time without a detailed device-health collector result.'
+        - macro: '{$AVIGILON.HEALTH.TIMEOUT}'
+          value: 60s
+          description: 'Timeout for the lower-frequency detailed device-health script.'
         - macro: '{$AVIGILON.SERVICE.NAME}'
           value: 'Avigilon Control Center Server'
           description: 'Exact Windows service name or display name; verify before enabling the optional service item.'
